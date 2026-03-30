@@ -17,8 +17,14 @@ Seed data files are in the seed_data/ directory.
 
 import os
 from pathlib import Path
-
+import json
+from datetime import datetime
+from decimal import Decimal
+from typing import List, Optional
+from sqlalchemy.orm import Session
+from sqlalchemy import text
 from dotenv import load_dotenv
+from ecommerce_pipeline.postgres_models import Customer, Order
 
 load_dotenv()
 
@@ -41,8 +47,88 @@ def seed(engine, mongo_db, redis_client=None, neo4j_driver=None):
         customers = json.load(open(SEED_DIR / "customers.json"))
         historical_orders = json.load(open(SEED_DIR / "historical_orders.json"))
     """
-    pass  # TODO: Phase 1 — load products and customers into Postgres + MongoDB
+    #pass  # TODO: Phase 1 — load products and customers into Postgres + MongoDB
+    # טעינת קבצי ה-JSON
+    products = json.load(open(SEED_DIR / "products.json"))
+    customers = json.load(open(SEED_DIR / "customers.json"))
+    historical_orders = json.load(open(SEED_DIR / "historical_orders.json"))
 
+    # מילון עזר לשליפת מחיר ושם מוצר לפי ID
+    product_lookup = {p["id"]: p for p in products}
+
+    with Session(engine) as session:
+        # ניקוי נתונים קיימים (לפי המבנה החדש - ללא OrderItem)
+        session.query(Order).delete()
+        session.query(Customer).delete()
+        mongo_db.products.delete_many({})
+        mongo_db.order_history.delete_many({})
+
+        print("Seeding Customers to Postgres...")
+        for c in customers:
+            customer = Customer(
+                customer_id=c["id"],
+                name=c["name"],
+                email=c["email"]
+            )
+            session.add(customer)
+        session.flush()
+
+        print("Seeding Products to MongoDB...")
+        if products:
+            mongo_db.products.insert_many(products)
+
+        print("Seeding Historical Orders (Hybrid Model)...")
+        for o in historical_orders:
+            order_date = datetime.fromisoformat(o["created_at"].replace("Z", "+00:00"))
+            
+            # חישוב ה-Total והכנת ה-Snapshot למונגו
+            order_total = Decimal("0.00")
+            snapshot_items = []
+            
+            for p_id in o.get("product_ids", []):
+                p_info = product_lookup.get(p_id)
+                if p_info:
+                    price = Decimal(str(p_info["price"]))
+                    order_total += price
+                    
+                    snapshot_items.append({
+                        "product_id": p_id,
+                        "name": p_info["name"],
+                        "price": float(price),
+                        "quantity": 1  # ברירת מחדל ל-Seed
+                    })
+
+            # א. יצירת ההזמנה ב-Postgres (כולל ה-Total שחושב)
+            db_order = Order(
+                order_id=o["order_id"],
+                customer_id=o["customer_id"],
+                total_amount=order_total,  # נשמר ב-SQL לדוחות
+                created_at=order_date
+            )
+            session.add(db_order)
+            
+            # ב. שמירת ה-Snapshot המלא ל-MongoDB (היסטוריה)
+            customer_info = next((c for c in customers if c["id"] == o["customer_id"]), None)
+            
+            mongo_db.order_history.insert_one({
+                "order_id": o["order_id"],
+                "customer": {
+                    "customer_id": o["customer_id"],
+                    "name": customer_info["name"] if customer_info else "Unknown",
+                    "email": customer_info["email"] if customer_info else ""
+                },
+                "items": snapshot_items,
+                "total_amount": float(order_total),
+                "created_at": o["created_at"]
+            })
+
+        session.commit()
+        # סנכרון ה-Sequence לערך הכי גבוה שהוכנס ידנית
+        session.execute(text("SELECT setval(pg_get_serial_sequence('orders', 'order_id'), coalesce(max(order_id), 1)) FROM orders;"))
+        session.execute(text("SELECT setval(pg_get_serial_sequence('customers', 'customer_id'), coalesce(max(customer_id), 1)) FROM customers;"))
+        session.commit()
+    print("Seeding complete successfully!")
+        
 
 # ---------------------------------------------------------------------------
 # CLI entry point
@@ -89,7 +175,7 @@ def _neo4j_driver():
 
 
 def main():
-    from sqlalchemy import create_engine
+    from sqlalchemy import create_engine, text
 
     engine = create_engine(_pg_url(), echo=False)
     mongo_db = _mongo_db()

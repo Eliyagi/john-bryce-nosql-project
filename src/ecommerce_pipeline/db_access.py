@@ -37,6 +37,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+from ecommerce_pipeline.models.responses import (
+        CategoryRevenueResponse,
+        OrderCustomerEmbed,
+        OrderItemResponse,
+        OrderResponse,
+        OrderSnapshotResponse,
+        ProductResponse,
+        RecommendationResponse,
+    )
 
 class DBAccess:
     def __init__(
@@ -66,7 +75,90 @@ class DBAccess:
         is saved for read access, and downstream counters and graph edges are
         updated (best-effort, does not roll back the order on failure).
         """
-        raise NotImplementedError("Phase 1: implement create_order")
+        # raise NotImplementedError("Phase 1: implement create_order")
+        from decimal import Decimal
+        from datetime import datetime
+        from ecommerce_pipeline.postgres_models import Customer, Order
+        
+
+        pg_session_factory = self._pg_session_factory
+    
+        with pg_session_factory() as session:
+            # 1. וולידציה שהלקוח קיים ב-Postgres
+            customer = session.query(Customer).filter_by(customer_id=customer_id).first()
+            if not customer:
+                raise ValueError(f"Customer with ID {customer_id} does not exist.")
+
+            total_amount = Decimal("0.00")
+            snapshot_items = []
+
+            # 2. בדיקת מלאי, קיום מוצר ואיסוף נתונים ל-Snapshot (מול MongoDB)
+            for item in items:
+                # חשוב: מחפשים לפי שדה "id" כפי שהגדרנו ב-Seed/Migrate
+                product_doc = self._mongo_db.products.find_one({"id": item.product_id})
+                
+                if not product_doc:
+                    raise ValueError(f"Product with ID {item.product_id} not found in catalog.")
+                
+                if product_doc.get("stock_quantity", 0) < item.quantity:
+                    raise ValueError(f"Insufficient stock for product: {product_doc.get('name')}")
+
+                # חישוב סכום
+                item_price = Decimal(str(product_doc["price"]))
+                total_amount += item_price * item.quantity
+
+                # הכנת הפריט ל-Snapshot במונגו
+                snapshot_items.append({
+                    "product_id": item.product_id,
+                    "product_name": product_doc["name"],
+                    "unit_price": float(item_price),
+                    "quantity": item.quantity
+                })
+
+            # 3. יצירת ההזמנה ב-Postgres (רק ה"שלד" עם ה-Total)
+            order = Order(
+                customer_id=customer_id, 
+                total_amount=total_amount
+            )
+            session.add(order)
+            session.flush()  # יצירת order_id לשימוש במונגו
+
+            # 4. עדכון מלאי במונגו ושמירת ה-Snapshot
+            for item in items:
+                # עדכון מלאי אטומי במונגו
+                self._mongo_db.products.update_one(
+                    {"id": item.product_id},
+                    {"$inc": {"stock_quantity": -item.quantity}}
+                )
+
+            # 5. שמירת ה-SNAPSHOT ב-MongoDB (היסטוריית הזמנות עשירה)
+            # שים לב לשם הקולקציה: order_history (כפי שהגדרנו ב-Seed)
+            self._mongo_db.order_history.insert_one({
+                "order_id": order.order_id,
+                "customer": {
+                    "customer_id": customer.customer_id,
+                    "name": customer.name,
+                    "email": customer.email
+                },
+                "items": snapshot_items,
+                "total_amount": float(total_amount),
+                "created_at": datetime.now()
+            })
+
+            session.commit()
+
+            session.refresh(order)
+
+        return OrderResponse(
+            order_id=order.order_id,
+            customer_id=customer_id,
+            total_amount=total_amount,
+            created_at=order.created_at.isoformat(),
+            # הוספת סטטוס ברירת מחדל (או מה שמוגדר ב-Schema שלך)
+            status="completed", 
+            # החזרת הפריטים מה-Snapshot שהכנת קודם למונגו
+            items=snapshot_items
+        )
 
     def get_product(self, product_id: int) -> ProductResponse | None:
         """Fetch a product by its integer ID.
@@ -74,7 +166,28 @@ class DBAccess:
         See ProductResponse in models/responses.py for the return shape.
         Returns None if not found.
         """
-        raise NotImplementedError("Phase 1: implement get_product")
+        #raise NotImplementedError("Phase 1: implement get_product")
+        # 1. גישה לקולקשן במונגו
+        products_col = self._mongo_db.products
+        
+        # 2. חיפוש לפי השדה 'id' (ה-ID העסקי מה-JSON)
+        product_data = products_col.find_one({"id": product_id})
+        
+        if not product_data:
+            return None
+            
+        # 3. מיפוי השדות ל-ProductResponse
+        # שים לב למיפוי של stock_quantity ו-category_fields
+        return ProductResponse(
+            id=product_data["id"],
+            name=product_data["name"],
+            price=float(product_data["price"]),
+            stock_quantity=product_data.get("stock", 0),  # מיפוי מ-'stock' ל-'stock_quantity'
+            category=product_data.get("category", "General"),
+            description=product_data.get("description", ""),
+            # category_fields מכיל את כל השדות שלא מוגדרים קבוע (כמו 'specs' או שדות דינמיים אחרים)
+            category_fields=product_data.get("category_fields", {}) 
+        )
 
     def search_products(
         self,
@@ -87,7 +200,40 @@ class DBAccess:
         q: case-insensitive substring match on the product name
         Both filters are ANDed together. Returns all products if both are None.
         """
-        raise NotImplementedError("Phase 1: implement search_products")
+        http://127.0.0.1:8000/products?category=electronics&q=Lap
+        
+        #raise NotImplementedError("Phase 1: implement search_products")
+        # 1. בניית השאילתה הדינמית (כמו WHERE ב-SQL)
+        query = {}
+        
+        # סינון לפי קטגוריה (Exact Match)
+        if category:
+            query["category"] = category
+            
+        # סינון לפי שם (Case-insensitive substring)
+        if q:
+            # $regex: חיפוש תת-מחרוזת, $options: 'i' הופך את זה ל-Case Insensitive
+            query["name"] = {"$regex": q, "$options": "i"}
+            
+        # 2. ביצוע השאילתה ב-Collection של המוצרים
+        products_cursor = self._mongo_db.products.find(query)
+        
+        # 3. המרת התוצאות לרשימה של ProductResponse
+        results = []
+        for p in products_cursor:
+            results.append(
+                ProductResponse(
+                    id=p["id"],
+                    name=p["name"],
+                    price=float(p["price"]),
+                    stock_quantity=p.get("stock", 0),  # מיפוי מ-'stock' ל-'stock_quantity'
+                    category=p.get("category", "General"),
+                    description=p.get("description", ""),
+                    category_fields=p.get("category_fields", {})
+                )
+            )
+            
+        return results
 
     def save_order_snapshot(
         self,

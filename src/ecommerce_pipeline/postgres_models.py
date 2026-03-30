@@ -26,12 +26,11 @@ class Customer(Base):
     __tablename__ = "customers"
 
     customer_id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    first_name: Mapped[str] = mapped_column(String(100), nullable=False)
-    last_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
-    # קשר להזמנות (צד ה-One ב-One-to-Many)
+    # קשר להזמנות
     orders: Mapped[List["Order"]] = relationship(back_populates="customer")
 
 class Order(Base):
@@ -39,10 +38,7 @@ class Order(Base):
 
     order_id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     customer_id: Mapped[int] = mapped_column(ForeignKey("customers.customer_id"), nullable=False)
-    order_date: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
-    
+    # total_amount חייב להיות כאן בשביל שאילתות סכימה מהירות ב-SQL
     total_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
-    status: Mapped[str] = mapped_column(String(50), default="pending")
-
-    # קשר חזרה ללקוח (צד ה-Many ב-One-to-Many)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     customer: Mapped["Customer"] = relationship(back_populates="orders")

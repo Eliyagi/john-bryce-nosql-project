@@ -15,7 +15,7 @@ What to implement in migrate():
 import os
 
 from dotenv import load_dotenv
-
+from ecommerce_pipeline.postgres_models import Base, Customer, Order
 load_dotenv()
 
 
@@ -31,8 +31,11 @@ def migrate(engine, mongo_db, redis_client=None, neo4j_driver=None):
         redis_client: redis.Redis instance or None (Phase 2+)
         neo4j_driver: neo4j.Driver instance or None (Phase 3)
     """
-    pass  # TODO: Phase 1 — create Postgres tables and MongoDB indexes
-
+    #pass  # TODO: Phase 1 — create Postgres tables and MongoDB indexes
+    Base.metadata.create_all(engine)
+    mongo_db.products.create_index("id", unique=True)
+    mongo_db.products.create_index("category")
+    mongo_db.order_history.create_index("order_id", unique=True)
 
 # ---------------------------------------------------------------------------
 # CLI entry point
