@@ -22,6 +22,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import List, Optional
 from sqlalchemy.orm import Session
+from itertools import combinations
 from sqlalchemy import text
 from dotenv import load_dotenv
 from ecommerce_pipeline.postgres_models import Customer, Order
@@ -62,6 +63,8 @@ def seed(engine, mongo_db, redis_client=None, neo4j_driver=None):
         session.query(Customer).delete()
         mongo_db.products.delete_many({})
         mongo_db.order_history.delete_many({})
+        if redis_client:
+            redis_client.flushdb()
 
         print("Seeding Customers to Postgres...")
         for c in customers:
@@ -73,13 +76,20 @@ def seed(engine, mongo_db, redis_client=None, neo4j_driver=None):
             session.add(customer)
         session.flush()
 
-        print("Seeding Products to MongoDB...")
+        print("Seeding Products to MongoDB & Redis...")
         if products:
-            mongo_db.products.insert_many(products)
+            # 1. שמירה במונגו
+            mongo_db.product_catalog.insert_many(products)
+
+            for p in products:
+            # מפתח נקי למלאי בלבד - לא מקבל TTL
+                redis_client.set(f"inventory:{p['id']}", p.get('stock_quantity', 0))
 
         print("Seeding Historical Orders (Hybrid Model)...")
+        print("Seeding neo4j...")
         for o in historical_orders:
             order_date = datetime.fromisoformat(o["created_at"].replace("Z", "+00:00"))
+            p_ids = o.get("product_ids", [])
             
             # חישוב ה-Total והכנת ה-Snapshot למונגו
             order_total = Decimal("0.00")
@@ -93,11 +103,12 @@ def seed(engine, mongo_db, redis_client=None, neo4j_driver=None):
                     
                     snapshot_items.append({
                         "product_id": p_id,
-                        "name": p_info["name"],
-                        "price": float(price),
-                        "quantity": 1  # ברירת מחדל ל-Seed
+                        "product_name": p_info["name"],
+                        "unit_price": float(price),
+                        "quantity": 1,
+                        "category": p_info.get("category", "General")
                     })
-
+    
             # א. יצירת ההזמנה ב-Postgres (כולל ה-Total שחושב)
             db_order = Order(
                 order_id=o["order_id"],
@@ -110,18 +121,35 @@ def seed(engine, mongo_db, redis_client=None, neo4j_driver=None):
             # ב. שמירת ה-Snapshot המלא ל-MongoDB (היסטוריה)
             customer_info = next((c for c in customers if c["id"] == o["customer_id"]), None)
             
-            mongo_db.order_history.insert_one({
+            mongo_db["order_snapshots"].insert_one({
                 "order_id": o["order_id"],
                 "customer": {
-                    "customer_id": o["customer_id"],
+                    "id": o["customer_id"],
                     "name": customer_info["name"] if customer_info else "Unknown",
                     "email": customer_info["email"] if customer_info else ""
                 },
                 "items": snapshot_items,
                 "total_amount": float(order_total),
+                "status": "completed",  # סטטוס לדוגמה
                 "created_at": o["created_at"]
             })
 
+            
+            # 4. בניית הגרף ב-Neo4j (החלק שפותר את בעיית השמות)
+            if neo4j_driver and len(p_ids) > 1:
+                with neo4j_driver.session() as neo_session:
+                    for p1, p2 in combinations(sorted(p_ids), 2):
+                        name1 = product_lookup.get(p1, {}).get("name", f"Product {p1}")
+                        name2 = product_lookup.get(p2, {}).get("name", f"Product {p2}")
+                        
+                        neo_session.run("""
+                            MERGE (a:Product {id: $p1}) SET a.name = $name1
+                            MERGE (b:Product {id: $p2}) SET b.name = $name2
+                            MERGE (a)-[r:BOUGHT_TOGETHER]-(b)
+                            ON CREATE SET r.weight = 1
+                            ON MATCH SET r.weight = r.weight + 1
+                        """, p1=p1, name1=name1, p2=p2, name2=name2)
+        
         session.commit()
         # סנכרון ה-Sequence לערך הכי גבוה שהוכנס ידנית
         session.execute(text("SELECT setval(pg_get_serial_sequence('orders', 'order_id'), coalesce(max(order_id), 1)) FROM orders;"))

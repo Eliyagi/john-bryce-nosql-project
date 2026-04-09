@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from ecommerce_pipeline.db import get_db_access
 from ecommerce_pipeline.db_access import DBAccess
 from ecommerce_pipeline.models.requests import CreateOrderRequest
-from ecommerce_pipeline.models.responses import OrderResponse, OrderSnapshotResponse
+from ecommerce_pipeline.models.responses import OrderResponse, OrderSnapshotResponse, OrderHistoryResponse
 
 router = APIRouter()
 
@@ -39,3 +39,13 @@ def get_order(
     if order is None:
         raise HTTPException(status_code=404, detail={"message": "order not found"})
     return order
+
+@router.get("/customer/{customer_id}/history", response_model=OrderHistoryResponse)
+def get_customer_orders(customer_id: int, db: DBAccess = Depends(get_db_access)):
+    """Fetch all orders by ID.
+    """
+    # 1. קריאה לפונקציה שכתבת ב-db_access
+    history_list = db.get_order_history(customer_id)
+    
+    # 2. החזרה בפורמט שהמרצה ביקש (אובייקט עם שדה orders)
+    return OrderHistoryResponse(orders=history_list)

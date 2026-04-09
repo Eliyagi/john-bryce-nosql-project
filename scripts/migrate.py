@@ -33,9 +33,19 @@ def migrate(engine, mongo_db, redis_client=None, neo4j_driver=None):
     """
     #pass  # TODO: Phase 1 — create Postgres tables and MongoDB indexes
     Base.metadata.create_all(engine)
-    mongo_db.products.create_index("id", unique=True)
-    mongo_db.products.create_index("category")
-    mongo_db.order_history.create_index("order_id", unique=True)
+    mongo_db.product_catalog.create_index("id", unique=True)
+    mongo_db.product_catalog.create_index("category")
+    mongo_db["order_snapshots"].create_index("order_id", unique=True)
+    mongo_db["order_snapshots"].create_index("customer.id") # אינדקס חשוב לשליפת היסטוריה
+    
+
+    # 3. Neo4j: אילוצים (Constraints)
+    if neo4j_driver: # הגנה במקרה והדרייבר הוא None
+        with neo4j_driver.session() as session:
+            # הבטחת ייחודיות של מוצר בגרף
+            session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (p:Product) REQUIRE p.id IS UNIQUE")
+    
+    print("Migration: Postgres tables, Mongo indexes, and Neo4j constraints are ready.")
 
 # ---------------------------------------------------------------------------
 # CLI entry point
